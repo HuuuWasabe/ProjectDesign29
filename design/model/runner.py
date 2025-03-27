@@ -1,7 +1,8 @@
-# smartfit.py
-import cv2
 import os
 import glob
+import cv2
+import imageio
+import random
 from modelLoader import PredictionModule
 from assessment import PostureAssessment
 
@@ -12,81 +13,110 @@ class SmartFit:
         self.model_checkpoint = model_checkpoint
         self.output_base = output_base
 
+        self.file_name = list()
+
     def get_latest_video(self):
-        # Search for all .mp4 files in a directory
-        video_files = glob.glob(os.path.join(self.input_dir, ".mp4"))
+        # Search for all .mp4 files in the directory
+        video_files = glob.glob(os.path.join(self.input_dir, "*.mp4"))
         if not video_files:
             raise FileNotFoundError("No videos found")
         latest_video = max(video_files, key=os.path.getmtime)
         return latest_video
 
     def process_video(self, input_video_path, output_video_path):
-        cap = cv2.VideoCapture(input_video_path)
-        fps = cap.get(cv2.CAP_PROP_FPS)
+        reader = imageio.get_reader(input_video_path)
+        meta_data = reader.get_meta_data()
+        fps = meta_data['fps']
+        writer = imageio.get_writer(output_video_path, fps=fps)
 
-        #width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        #height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-        width  = 1280
-        height = 720
-
-        fourcc = cv2.VideoWriter_fourcc(*'X264')
-        out = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
-
-        # Class modules
+        # Initialize class modules
         pred_module = PredictionModule()
         posture_assessor = PostureAssessment()
 
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        pred_arr = []
         segment_frames = []
-        current_frame = 0
-        segment_duration_sec = 2.0 # Duration of clip that the model will predict
+        segment_duration_sec = 2.0  # Duration for each clip, 2 for good measure na lang
         segment_frame_count = int(segment_duration_sec * fps)
-        video_path = input_video_path  # Use the same video for clip extraction
+        current_frame = 0
 
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-
+        # Process video frame-by-frame using imageio
+        for frame in reader:
             segment_frames.append(frame)
             current_frame += 1
 
-            if len(segment_frames) == segment_frame_count or current_frame == frame_count:
-                segment_index = (current_frame - len(segment_frames)) / fps
-                start_sec = segment_index
+            if len(segment_frames) == segment_frame_count:
+                start_sec = (current_frame - len(segment_frames)) / fps
                 end_sec = start_sec + segment_duration_sec
 
-                predicted_action = pred_module.predict(video_path, start_sec, end_sec)
-                
+                # Predict action based on the current segment
+                predicted_action = pred_module.predict(input_video_path, start_sec, end_sec)
+                pred_arr.append(predicted_action) # Append predictions
+
+                # Use the middle frame for posture assessment
                 rep_frame = segment_frames[len(segment_frames) // 2]
-                rep_frame_rgb = cv2.cvtColor(rep_frame, cv2.COLOR_BGR2RGB)
-                feedback = posture_assessor.get_landmarks(rep_frame_rgb, predicted_action)
+                feedback = posture_assessor.get_landmarks(rep_frame, predicted_action)
+                
 
-                # Add annotations for visualization, para makita kung ano ganap
+                # Annotate each frame in the segment with action and feedback text
                 for frm in segment_frames:
-                    cv2.putText(frm, f"Action: {predicted_action}", (30, 30),
+                    frm_bgr = cv2.cvtColor(frm, cv2.COLOR_RGB2BGR)
+                    cv2.putText(frm_bgr, f"Action: {predicted_action}", (30, 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
-                    cv2.putText(frm, f"Feedback: {feedback}", (30, 70),
+                    
+                    cv2.putText(frm_bgr, f"Feedback: {feedback}", (30, 70),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
-                    out.write(frm)
-
+                    
+                    annotated_frame = cv2.cvtColor(frm_bgr, cv2.COLOR_BGR2RGB)
+                    writer.append_data(annotated_frame)
+                
                 segment_frames = []
+        
+        # Check for leftover frames
+        if segment_frames:
+            start_sec = (current_frame - len(segment_frames)) / fps
+            end_sec = current_frame / fps  # Duration might be less than segment_duration_sec
+            predicted_action = pred_module.predict(input_video_path, start_sec, end_sec)
+            rep_frame = segment_frames[len(segment_frames) // 2]
+            feedback = posture_assessor.get_landmarks(rep_frame, predicted_action)
 
-        cap.release()
-        out.release()
-        cv2.destroyAllWindows()
+            for frm in segment_frames:
+                frm_bgr = cv2.cvtColor(frm, cv2.COLOR_RGB2BGR)
+                cv2.putText(frm_bgr, f"Action: {predicted_action}", (30, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
+                cv2.putText(frm_bgr, f"Feedback: {feedback}", (30, 70),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
+                annotated_frame = cv2.cvtColor(frm_bgr, cv2.COLOR_BGR2RGB)
+                writer.append_data(annotated_frame)
+
+        writer.close()
+        reader.close()
+
+        #print(pred_arr)
+        self.file_name = pred_arr
+    
+    def renameFile(self, arr):
+        return max(set(arr), key=arr.count)
 
     def run(self):
-        latest_video_file = self.input_dir
-        #latest_video_file = self.get_latest_video() # Change into this later
-        
-        print(f"Latest video found: {latest_video_file}")
+        random.seed(0)
+        latest_video_file = self.get_latest_video()
+        #print(f"Latest video found: {latest_video_file}")
+
         user_output_folder = os.path.join(self.output_base, self.account_user)
         os.makedirs(user_output_folder, exist_ok=True)
-        
         video_filename = os.path.basename(latest_video_file)
-        output_video_path = os.path.join(user_output_folder, f"processed_{video_filename}")
+        
+        temp_output_video_path = os.path.join(user_output_folder, f"temp_file_{video_filename}")
 
-        self.process_video(latest_video_file, output_video_path)
-        print(f"Processed video saved to: {output_video_path}")
+        # For a much more cleaner removal, para walang error
+        try:
+            self.process_video(latest_video_file, temp_output_video_path)
+            most_predicted = self.renameFile(self.file_name)
+            new_output_video_path = os.path.join(user_output_folder, f"{random.randint(0,9999)}_{most_predicted}.mp4")
+
+            os.rename(temp_output_video_path, new_output_video_path)
+            #print(f"Processed video saved to: {new_output_video_path}")
+        finally:
+            if os.path.exists(temp_output_video_path):
+                os.remove(temp_output_video_path) # Remove temp
+
